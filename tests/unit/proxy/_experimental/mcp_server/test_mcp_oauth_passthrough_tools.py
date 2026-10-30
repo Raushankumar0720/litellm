@@ -1,4 +1,5 @@
 from litellm.proxy._experimental.mcp_server import operations as mcp_operations
+
 """Unit tests for MCP OAuth passthrough tool-fetch behavior."""
 
 import logging
@@ -7,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-
 
 if sys.version_info < (3, 11):
     from exceptiongroup import ExceptionGroup
@@ -326,7 +326,6 @@ async def test_aggregate_list_tools_absorbs_one_unauthenticated_server():
 
     from mcp.types import Tool as MCPTool
 
-    from litellm.proxy._experimental.mcp_server import server as mcp_server
     from litellm.proxy._types import UserAPIKeyAuth
 
     delegate = _http_server(
@@ -369,7 +368,6 @@ async def test_single_server_route_also_absorbs_upstream_auth_error():
     re-auth surfacing is handled by a request-scope preemptive check, tracked separately."""
     from unittest.mock import patch
 
-    from litellm.proxy._experimental.mcp_server import server as mcp_server
     from litellm.proxy._experimental.mcp_server.mcp_context import mcp_gateway_server_name
     from litellm.proxy._types import UserAPIKeyAuth
 
@@ -410,7 +408,6 @@ async def test_aggregate_with_single_accessible_server_still_absorbs():
     permission sets."""
     from unittest.mock import patch
 
-    from litellm.proxy._experimental.mcp_server import server as mcp_server
     from litellm.proxy._types import UserAPIKeyAuth
 
     delegate = _http_server(
@@ -453,9 +450,8 @@ async def test_fetch_tools_logs_upstream_request_details_on_500(caplog):
         side_effect=httpx.HTTPStatusError("500", request=request, response=response)
     )
 
-    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
-        with pytest.raises(MCPServerListError):
-            await manager._fetch_tools_with_timeout(mock_client, "sample_docs")
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"), pytest.raises(MCPServerListError):
+        await manager._fetch_tools_with_timeout(mock_client, "sample_docs")
 
     assert "POST https://upstream/ -> HTTP 500" in caplog.text
     assert '"method":"initialize"' in caplog.text
@@ -471,9 +467,8 @@ async def test_client_creation_failure_logs_sanitized_exchange(monkeypatch, capl
     response = httpx.Response(500, request=request, json={"error":"missing_scope"})
     error = httpx.HTTPStatusError("query-secret", request=request, response=response)
     monkeypatch.setattr(manager, "create_mcp_client", AsyncMock(side_effect=error))
-    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
-        with pytest.raises(MCPServerListError):
-            await manager._get_tools_from_server(server)
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"), pytest.raises(MCPServerListError):
+        await manager._get_tools_from_server(server)
     assert "POST https://upstream/ -> HTTP 500" in caplog.text
     assert "missing_scope" in caplog.text and "query-secret" not in caplog.text
 
@@ -498,3 +493,165 @@ def test_passthrough_admission_recognizes_only_matching_authorization(oauth_head
 
     server = MCPServer(server_id="catalog", name="catalog", alias="catalog", transport=MCPTransport.http)
     assert _client_has_passthrough_authorization(server, oauth_headers, server_headers) is authorized
+
+
+@pytest.mark.asyncio
+async def test_probe_upstream_auth_surfaces_401_from_tools_list_when_initialize_returns_200():
+    """Some MCP upstreams (e.g. Datadog) accept initialize without verifying the OAuth token,
+    gating auth on tools/list. _probe_upstream_auth must detect tools/list 401."""
+    from unittest.mock import patch
+
+    from litellm.proxy._experimental.mcp_server.server import _probe_upstream_auth
+
+    mock_client = MagicMock()
+    init_request = httpx.Request("POST", "https://upstream.example.com/mcp")
+    init_response = httpx.Response(200, request=init_request)
+
+    tools_request = httpx.Request("POST", "https://upstream.example.com/mcp")
+    tools_response = httpx.Response(
+        401,
+        headers={"www-authenticate": 'Bearer error="invalid_token"'},
+        request=tools_request,
+    )
+
+    # First call is initialize (200), second call is tools/list (raises 401)
+    mock_client.post = AsyncMock(
+        side_effect=[
+            init_response,
+            httpx.HTTPStatusError("401 Unauthorized", request=tools_request, response=tools_response),
+        ]
+    )
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.server.get_async_httpx_client",
+        return_value=mock_client,
+    ):
+        status_code, www_auth = await _probe_upstream_auth(
+            url="https://upstream.example.com/mcp",
+            auth_header="Bearer expired-token",
+        )
+
+    assert status_code == 401
+    assert www_auth == 'Bearer error="invalid_token"'
+    assert mock_client.post.call_count == 2
+    # Check the payloads sent
+    assert mock_client.post.call_args_list[0].kwargs["json"]["method"] == "initialize"
+    assert mock_client.post.call_args_list[1].kwargs["json"]["method"] == "tools/list"
+
+
+@pytest.mark.asyncio
+async def test_probe_upstream_auth_preserves_200_when_tools_list_succeeds():
+    """When both initialize and tools/list succeed, _probe_upstream_auth returns 200."""
+    from unittest.mock import patch
+
+    from litellm.proxy._experimental.mcp_server.server import _probe_upstream_auth
+
+    mock_client = MagicMock()
+    init_request = httpx.Request("POST", "https://upstream.example.com/mcp")
+    init_response = httpx.Response(200, request=init_request)
+    tools_request = httpx.Request("POST", "https://upstream.example.com/mcp")
+    tools_response = httpx.Response(200, request=tools_request)
+
+    mock_client.post = AsyncMock(side_effect=[init_response, tools_response])
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.server.get_async_httpx_client",
+        return_value=mock_client,
+    ):
+        status_code, www_auth = await _probe_upstream_auth(
+            url="https://upstream.example.com/mcp",
+            auth_header="Bearer valid-token",
+        )
+
+    assert status_code == 200
+    assert www_auth is None
+
+
+@pytest.mark.asyncio
+async def test_probe_upstream_auth_fails_open_on_tools_list_non_auth_error():
+    """If tools/list fails with a non-auth error (e.g. 500 or network timeout), probe fails open."""
+    from unittest.mock import patch
+
+    from litellm.proxy._experimental.mcp_server.server import _probe_upstream_auth
+
+    mock_client = MagicMock()
+    init_request = httpx.Request("POST", "https://upstream.example.com/mcp")
+    init_response = httpx.Response(200, request=init_request)
+
+    tools_request = httpx.Request("POST", "https://upstream.example.com/mcp")
+    tools_response = httpx.Response(500, request=tools_request)
+
+    mock_client.post = AsyncMock(
+        side_effect=[
+            init_response,
+            httpx.HTTPStatusError("500 Internal Server Error", request=tools_request, response=tools_response),
+        ]
+    )
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.server.get_async_httpx_client",
+        return_value=mock_client,
+    ):
+        status_code, www_auth = await _probe_upstream_auth(
+            url="https://upstream.example.com/mcp",
+            auth_header="Bearer token",
+        )
+
+    assert status_code == 200
+    assert www_auth is None
+
+
+@pytest.mark.asyncio
+async def test_check_passthrough_upstream_auth_absorbs_in_aggregate_route():
+    """In an aggregate route (mcp_servers is None or len > 1), an upstream 401 must not raise
+    HTTPException(401) and abort the entire request."""
+    from unittest.mock import patch
+
+    from litellm.proxy._experimental.mcp_server.server import _check_passthrough_upstream_auth
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.types.mcp import MCPAuth, MCPTransport
+    from litellm.types.mcp_server.mcp_server_manager import MCPServer
+
+    server = MCPServer(
+        server_id="s1",
+        name="datadog",
+        url="https://upstream.example.com/mcp",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.none,
+        oauth_passthrough=True,
+        extra_headers=["Authorization"],
+    )
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "headers": [
+            (b"x-litellm-api-key", b"sk-proxy-key"),
+            (b"authorization", b"Bearer expired-token"),
+        ],
+    }
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.operations._get_allowed_mcp_servers",
+            new=AsyncMock(return_value=[server]),
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.server._probe_upstream_auth",
+            new=AsyncMock(return_value=(401, 'Bearer error="invalid_token"')),
+        ),
+    ):
+        # Aggregate route: mcp_servers is None
+        # Must return None (absorb) and not raise HTTPException
+        result = await _check_passthrough_upstream_auth(
+            scope=scope,
+            user_api_key_auth=UserAPIKeyAuth(user_id="u1"),
+            mcp_servers=None,
+            client_ip=None,
+            oauth2_headers={"Authorization": "Bearer expired-token"},
+            mcp_server_auth_headers=None,
+            raw_headers={"Authorization": "Bearer expired-token"},
+        )
+        assert result is None
+

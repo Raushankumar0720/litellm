@@ -2003,6 +2003,35 @@ if MCP_AVAILABLE:
                 json=probe_payload,
                 timeout=timeout,
             )
+            if resp.status_code == 200 and auth_header:
+                # Some upstreams (e.g. Datadog) accept initialize without validating
+                # the OAuth bearer token, gating authentication on tools/list. Probe
+                # tools/list so expired tokens are caught before HTTP 200 headers commit.
+                tools_payload: Final = {
+                    "jsonrpc": "2.0",
+                    "id": "litellm-mcp-auth-probe-tools",
+                    "method": "tools/list",
+                    "params": {},
+                }
+                try:
+                    tools_resp: Final = await client.post(
+                        url=url,
+                        headers=probe_headers,
+                        json=tools_payload,
+                        timeout=timeout,
+                    )
+                    if tools_resp.status_code in (401, 403):
+                        return tools_resp.status_code, tools_resp.headers.get("www-authenticate")
+                except httpx.HTTPStatusError as tools_exc:
+                    if tools_exc.response.status_code in (401, 403):
+                        return tools_exc.response.status_code, tools_exc.response.headers.get("www-authenticate")
+                except Exception as tools_exc:  # noqa: BLE001
+                    verbose_logger.debug(
+                        "_probe_upstream_auth: tools/list probe to %s failed (%s), falling back to initialize result",
+                        url,
+                        tools_exc,
+                    )
+
             return resp.status_code, resp.headers.get("www-authenticate")
         except httpx.HTTPStatusError as exc:
             # AsyncHTTPHandler.post() calls raise_for_status(); a 401/403 from
@@ -2089,6 +2118,11 @@ if MCP_AVAILABLE:
         )
         for (_srv, _, challenge_server_name), (probe_status, _) in zip(probe_targets, probe_results):
             if probe_status == 401:
+                # In aggregate routes (multiple or unspecified servers), do not abort
+                # the entire gateway with a 401 for a single upstream. Tool listing
+                # absorbs it as an "auth_required" outcome so other servers succeed.
+                if len(mcp_servers or []) != 1:
+                    continue
                 # Token is missing or expired: keep pass-through clients on the
                 # protected-resource discovery flow so they re-authorize against
                 # the upstream IdP metadata proxied by LiteLLM.
@@ -2103,6 +2137,8 @@ if MCP_AVAILABLE:
                     headers={"www-authenticate": www_authenticate},
                 )
             if probe_status == 403:
+                if len(mcp_servers or []) != 1:
+                    continue
                 # Token is valid but the caller lacks permission — do not hint
                 # at re-authorization (RFC 9110: a fresh token with the same
                 # scopes would just hit 403 again and loop indefinitely).
